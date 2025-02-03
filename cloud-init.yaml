@@ -1,64 +1,153 @@
 #cloud-config
 package_update: true
 package_upgrade: true
+
 packages:
   - mariadb-server
+  - mariadb-client
   - galera-4
   - rsync
-  - mariadb-client
   - jq
   - netcat
+  - supervisor
+  - ufw
+  - locales
+
+write_files:
+  - content: |
+      #!/bin/bash
+      set -e
+
+      exec 1> >(tee -a /var/log/galera-setup.log)
+      exec 2>&1
+
+      echo "Starting Galera setup at $(date)"
+
+      # Create temporary non-galera config for initialization
+      cat > /etc/mysql/mariadb.conf.d/60-galera.cnf << INNEREOF
+      [mysqld]
+      bind-address = 0.0.0.0
+      max_connections = 1000
+      innodb_buffer_pool_size = 128M
+      innodb_log_file_size = 48M
+      innodb_file_per_table = 1
+      binlog_format = ROW
+      # Temporarily disable Galera for initialization
+      wsrep_on = OFF
+      INNEREOF
+
+      # Setup volume
+      VOLUME_PATH="/dev/disk/by-id/scsi-0HC_Volume_${volume_id}"
+      MOUNT_POINT="/mnt/${node_name}-volume"
+      mkdir -p "$MOUNT_POINT"
+
+      echo "Waiting for volume at $VOLUME_PATH..."
+      for i in {1..60}; do
+        if [ -L "$VOLUME_PATH" ]; then
+          break
+        fi
+        sleep 2
+      done
+
+      if [ ! -L "$VOLUME_PATH" ]; then
+        echo "Volume not found after waiting"
+        exit 1
+      fi
+
+      # Mount volume
+      if ! mount | grep -q "$MOUNT_POINT"; then
+        if ! blkid "$VOLUME_PATH" | grep -q "ext4"; then
+          mkfs.ext4 -F "$VOLUME_PATH"
+        fi
+        mount -o discard,defaults "$VOLUME_PATH" "$MOUNT_POINT"
+        echo "$VOLUME_PATH $MOUNT_POINT ext4 discard,defaults,nofail 0 0" >> /etc/fstab
+      fi
+
+      # Setup MySQL directories
+      rm -rf /var/lib/mysql
+      ln -s "$MOUNT_POINT" /var/lib/mysql
+      mkdir -p /var/log/mysql /var/run/mysqld
+      chown -R mysql:mysql "$MOUNT_POINT" /var/log/mysql /var/run/mysqld
+      chown -h mysql:mysql /var/lib/mysql
+      chmod 755 /var/run/mysqld
+
+      # Initialize MySQL with Galera disabled
+      echo "Initializing MySQL data directory..."
+      mysql_install_db --user=mysql --datadir="$MOUNT_POINT"
+
+      # Configure firewall
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow 22/tcp
+      ufw allow 3306/tcp
+      ufw allow 4444/tcp
+      ufw allow 4567/tcp
+      ufw allow 4568/tcp
+      ufw allow 4567/udp
+      ufw allow from 10.1.0.0/24 to any
+      ufw --force enable
+
+      # Now configure for Galera
+      if [ "${bootstrap}" = "true" ]; then
+        echo "Configuring as bootstrap node..."
+        cat > /etc/mysql/mariadb.conf.d/60-galera.cnf << INNEREOF
+      [mysqld]
+      bind-address = 0.0.0.0
+      max_connections = 1000
+      innodb_buffer_pool_size = 128M
+      innodb_log_file_size = 48M
+      innodb_file_per_table = 1
+      binlog_format = ROW
+
+      wsrep_on = ON
+      wsrep_provider = /usr/lib/galera/libgalera_smm.so
+      wsrep_cluster_name = galera_cluster
+      wsrep_cluster_address = gcomm://
+      wsrep_node_name = ${node_name}
+      wsrep_node_address = ${node_ip}
+      wsrep_sst_method = rsync
+      wsrep_provider_options = "pc.recovery=FALSE;gcache.size=128M"
+      INNEREOF
+
+        echo "Starting Galera bootstrap..."
+        galera_new_cluster
+      else
+        echo "Configuring as cluster node..."
+        cat > /etc/mysql/mariadb.conf.d/60-galera.cnf << INNEREOF
+      [mysqld]
+      bind-address = 0.0.0.0
+      max_connections = 1000
+      innodb_buffer_pool_size = 128M
+      innodb_log_file_size = 48M
+      innodb_file_per_table = 1
+      binlog_format = ROW
+
+      wsrep_on = ON
+      wsrep_provider = /usr/lib/galera/libgalera_smm.so
+      wsrep_cluster_name = galera_cluster
+      wsrep_cluster_address = gcomm://${cluster_ips}
+      wsrep_node_name = ${node_name}
+      wsrep_node_address = ${node_ip}
+      wsrep_sst_method = rsync
+      wsrep_provider_options = "pc.recovery=FALSE;gcache.size=128M"
+      INNEREOF
+
+        echo "Starting MariaDB..."
+        systemctl start mysql
+      fi
+
+      echo "Setup completed at $(date)"
+    path: /usr/local/bin/setup-galera.sh
+    permissions: '0755'
 
 runcmd:
-  # Ensure disk is formatted (only if unformatted)
-  - if [ ! -d "/mnt/db-data" ]; then mkfs.ext4 ${volume_path}; fi
-
-  # Mount the volume to MySQL data directory
-  - mkdir -p /mnt/db-data
-  - mount ${volume_path} /mnt/db-data
-  - chown -R mysql:mysql /mnt/db-data
-  - chmod 700 /mnt/db-data
-
-  # Persist the mount across reboots
-  - echo "${volume_path} /mnt/db-data ext4 defaults 0 0" >> /etc/fstab
-
-  # Move MySQL data directory
-  - systemctl stop mariadb
-  - mv /var/lib/mysql /var/lib/mysql.bak
-  - ln -s /mnt/db-data /var/lib/mysql
-  - chown -R mysql:mysql /var/lib/mysql
-  - systemctl start mariadb
-
-  # Configure Galera Cluster
-  - echo "[mysqld]" > /etc/mysql/conf.d/galera.cnf
-  - echo "bind-address = 0.0.0.0" >> /etc/mysql/conf.d/galera.cnf
-  - echo "default-storage-engine = InnoDB" >> /etc/mysql/conf.d/galera.cnf
-  - echo "innodb_autoinc_lock_mode = 2" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_on = ON" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_provider = /usr/lib/galera/libgalera_smm.so" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_cluster_address = \"gcomm://${cluster_ips}\"" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_cluster_name = \"GaleraCluster\"" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_node_name = \"${node_name}\"" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_node_address = \"${node_ip}\"" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_sst_method = rsync" >> /etc/mysql/conf.d/galera.cnf
-  - echo "wsrep_sst_auth = root:${mariadb_root_pw}" >> /etc/mysql/conf.d/galera.cnf
-
-  # Start the MariaDB service
-  - systemctl enable mariadb
-  - systemctl start mariadb
-
-  # Initialize Galera Cluster only on the first node
-  - if [ "$node_name" == "db-node-1" ]; then galera_new_cluster; fi
-
-  # Setup Log and Temp Cleanup Cron Jobs
-  - echo "0 2 * * * root find /var/log -type f -mtime +7 -exec rm -f {} \;" >> /etc/cron.d/log-cleanup
-  - echo "0 3 * * * root find /tmp -type f -mtime +1 -exec rm -f {} \;" >> /etc/cron.d/temp-cleanup
-
-  # Optimize MySQL Tables Weekly
-  - echo "0 4 * * 0 root mysql -u root -p${mariadb_root_pw} -e 'SELECT CONCAT(\"OPTIMIZE TABLE \", table_schema, \".\", table_name, \";\") FROM information_schema.tables WHERE table_schema NOT IN (\"mysql\", \"information_schema\", \"performance_schema\", \"sys\");' | mysql -u root -p${mariadb_root_pw}" >> /etc/cron.d/mysql-optimize
-
-  # Set Permissions and Restart Cron
-  - chmod 644 /etc/cron.d/log-cleanup
-  - chmod 644 /etc/cron.d/temp-cleanup
-  - chmod 644 /etc/cron.d/mysql-optimize
-  - systemctl restart cron
+  # Stop any existing services
+  - systemctl stop mysql || true
+  - systemctl disable mysql || true
+  - systemctl stop supervisor || true
+  - systemctl disable supervisor || true
+  # Update and install packages
+  - DEBIAN_FRONTEND=noninteractive apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client galera-4
+  # Run setup
+  - bash /usr/local/bin/setup-galera.sh

@@ -2,7 +2,7 @@ terraform {
   required_providers {
     hcloud = {
       source  = "hetznercloud/hcloud"
-      version = "~> 1.44.0" # Use the latest available version
+      version = "~> 1.44.0"
     }
   }
 }
@@ -30,7 +30,7 @@ variable "server_count" {
 variable "server_type" {
   description = "Type of Hetzner Cloud server"
   type        = string
-  default     = "cx21"
+  default     = "cx22"
 }
 
 variable "server_image" {
@@ -73,6 +73,13 @@ resource "hcloud_network" "private_network" {
   ip_range = "10.1.0.0/24"
 }
 
+resource "hcloud_network_subnet" "private_subnet" {
+  network_id   = hcloud_network.private_network.id
+  type         = "cloud"
+  network_zone = "eu-central"
+  ip_range     = "10.1.0.0/24"
+}
+
 resource "hcloud_volume" "db_volumes" {
   count      = var.server_count
   name       = "db-node-${count.index + 1}-volume"
@@ -92,16 +99,16 @@ resource "hcloud_server" "db_nodes" {
 
   network {
     network_id = hcloud_network.private_network.id
+    ip         = "10.1.0.${10 + count.index}"
   }
-
-  volumes = [hcloud_volume.db_volumes[count.index].id]
 
   user_data = templatefile("${path.module}/cloud-init.yaml", {
     node_name       = "db-node-${count.index + 1}"
-    node_ip         = "10.1.0.${count.index + 10}"
-    cluster_ips     = join(",", formatlist("10.1.0.%d", range(10, 10 + var.server_count)))
+    node_ip         = "10.1.0.${10 + count.index}"
+    cluster_ips     = join(",", [for i in range(var.server_count) : "10.1.0.${10 + i}"])
     mariadb_root_pw = "SecureRootPassword"
-    volume_path     = "/dev/disk/by-id/scsi-0HC_Volume_db-node-${count.index + 1}-volume"
+    volume_id       = hcloud_volume.db_volumes[count.index].id
+    bootstrap       = count.index == 0 ? "true" : "false"
   })
 
   labels = {
@@ -109,19 +116,21 @@ resource "hcloud_server" "db_nodes" {
   }
 }
 
-resource "hcloud_load_balancer" "galera_lb" {
-  name                = var.load_balancer_name
-  load_balancer_type  = "lb11"
-  location            = var.location
-  network_id          = hcloud_network.private_network.id
-  use_private_ip      = true
+resource "hcloud_volume_attachment" "db_volume_attachments" {
+  count      = var.server_count
+  server_id  = hcloud_server.db_nodes[count.index].id
+  volume_id  = hcloud_volume.db_volumes[count.index].id
 }
 
-resource "hcloud_load_balancer_target" "lb_targets" {
-  count             = var.server_count
-  load_balancer_id  = hcloud_load_balancer.galera_lb.id
-  type              = "server"
-  server_id         = hcloud_server.db_nodes[count.index].id
+resource "hcloud_load_balancer" "galera_lb" {
+  name               = var.load_balancer_name
+  load_balancer_type = "lb11"
+  location           = var.location
+}
+
+resource "hcloud_load_balancer_network" "lb_network" {
+  load_balancer_id = hcloud_load_balancer.galera_lb.id
+  network_id       = hcloud_network.private_network.id
 }
 
 resource "hcloud_load_balancer_service" "mysql_service" {
@@ -129,13 +138,19 @@ resource "hcloud_load_balancer_service" "mysql_service" {
   protocol         = "tcp"
   listen_port      = 3306
   destination_port = 3306
+
+  health_check {
+    protocol = "tcp"
+    port     = 3306
+    interval = 15
+    timeout  = 10
+    retries  = 3
+  }
 }
 
-resource "hcloud_load_balancer_service_health_check" "mysql_health_check" {
-  load_balancer_service_id = hcloud_load_balancer_service.mysql_service.id
-  protocol                 = "tcp"
-  port                     = 3306
-  interval                 = 15
-  timeout                  = 10
-  retries                  = 3
+resource "hcloud_load_balancer_target" "lb_targets" {
+  count             = var.server_count
+  load_balancer_id  = hcloud_load_balancer.galera_lb.id
+  type              = "server"
+  server_id         = hcloud_server.db_nodes[count.index].id
 }
